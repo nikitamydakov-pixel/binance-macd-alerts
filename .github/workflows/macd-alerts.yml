@@ -1,0 +1,80 @@
+name: MACD Zero Line Scanner
+
+on:
+  schedule:
+    # Every 5 minutes, offset from the busiest minute at the top of the hour.
+    - cron: '2-59/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      reset_state:
+        description: 'Ignore previous state and establish a new baseline (only if required)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: macd-zero-scanner
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Restore newest successful state artifact
+        if: ${{ !inputs.reset_state }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .state
+          # Fail on API/auth errors rather than silently resetting dedup state.
+          run_ids=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/macd-alerts.yml/runs?status=success&per_page=15" \
+            --jq '.workflow_runs[].id')
+          if [ -z "$run_ids" ]; then
+            echo "First successful run: establishing baseline"
+            exit 0
+          fi
+          restored=false
+          for run_id in $run_ids; do
+            if gh run download "$run_id" --name macd-state --dir .state > /dev/null 2>&1 \
+                && [ -s .state/state.json ]; then
+              echo "Restored state from run $run_id"
+              restored=true
+              break
+            fi
+          done
+          if [ "$restored" != "true" ]; then
+            echo "ERROR: A prior successful run exists, but its checkpoint is missing." >&2
+            echo "Restore the artifact, or manually run with reset_state=true (loses old signal history)." >&2
+            exit 1
+          fi
+
+      - name: Scan MACD and send Telegram alerts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_REQUESTS_PER_SECOND: '7'
+          MAX_WORKERS: '8'
+          STATE_PATH: .state/state.json
+        run: python scanner.py
+
+      - name: Save checkpoint for the next run
+        uses: actions/upload-artifact@v4
+        with:
+          name: macd-state
+          path: .state/state.json
+          if-no-files-found: error
+          retention-days: 2
