@@ -1,13 +1,13 @@
-name: MACD Zero Line Scanner
+name: Bybit MACD Zero Line Scanner
 
 on:
   schedule:
-    # Every 5 minutes, offset from the busiest minute at the top of the hour.
+    # :02, :07, :12, :17 ... UTC. GitHub can delay or occasionally skip runs.
     - cron: '2-59/5 * * * *'
   workflow_dispatch:
     inputs:
       reset_state:
-        description: 'Ignore previous state and establish a new baseline (only if required)'
+        description: 'Start fresh Bybit checkpoints (no historical Telegram signals)'
         type: boolean
         default: false
 
@@ -16,7 +16,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: macd-zero-scanner
+  group: bybit-macd-zero-scanner
   cancel-in-progress: false
 
 jobs:
@@ -32,49 +32,46 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Restore newest successful state artifact
+      - name: Restore last Bybit checkpoint
         if: ${{ !inputs.reset_state }}
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p .state
-          # Fail on API/auth errors rather than silently resetting dedup state.
+          # Dedicated artifact name: NEVER read older Binance checkpoints.
           run_ids=$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/macd-alerts.yml/runs?status=success&per_page=15" \
-            --jq '.workflow_runs[].id')
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=bybit-macd-state-v1&per_page=100" \
+            --jq '.artifacts[] | select(.expired == false) | .workflow_run.id')
           if [ -z "$run_ids" ]; then
-            echo "First successful run: establishing baseline"
+            echo "No existing Bybit state: initial synchronization"
             exit 0
           fi
-          restored=false
           for run_id in $run_ids; do
-            if gh run download "$run_id" --name macd-state --dir .state > /dev/null 2>&1 \
-                && [ -s .state/state.json ]; then
-              echo "Restored state from run $run_id"
-              restored=true
-              break
+            if gh run download "$run_id" --name bybit-macd-state-v1 --dir .state > /dev/null 2>&1 \
+                 && [ -s .state/state.json ]; then
+              echo "Bybit state restored from workflow run $run_id"
+              exit 0
             fi
           done
-          if [ "$restored" != "true" ]; then
-            echo "ERROR: A prior successful run exists, but its checkpoint is missing." >&2
-            echo "Restore the artifact, or manually run with reset_state=true (loses old signal history)." >&2
-            exit 1
-          fi
+          echo "ERROR: Bybit checkpoint exists but could not be downloaded." >&2
+          echo "Fix artifact permissions, or manually run with reset_state=true." >&2
+          exit 1
 
-      - name: Scan MACD and send Telegram alerts
+      - name: Scan Bybit MACD and send Telegram alerts
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BINANCE_REQUESTS_PER_SECOND: '7'
+          BYBIT_REQUESTS_PER_SECOND: '7'
           MAX_WORKERS: '8'
           STATE_PATH: .state/state.json
         run: python scanner.py
 
-      - name: Save checkpoint for the next run
+      - name: Save Bybit checkpoint for next run
         uses: actions/upload-artifact@v4
         with:
-          name: macd-state
+          name: bybit-macd-state-v1
           path: .state/state.json
           if-no-files-found: error
-          retention-days: 2
+          retention-days: 30
