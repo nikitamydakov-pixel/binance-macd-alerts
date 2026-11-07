@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""MACD(12,26,9) zero-line alerts for Binance USDⓈ-M USDT futures.
+"""Bybit V5 USDT perpetual MACD(12,26,9) zero-line Telegram alerts.
 
-Python 3.12+, standard library only. Designed for GitHub Actions every 5 minutes.
-State is restored/saved by the workflow as an Actions artifact.
+Runs on GitHub Actions every 5 minutes. Python 3.12+, standard library only.
+Only confirmed/closed exchange candles are considered.
 """
-
 from __future__ import annotations
 
 import concurrent.futures
 import datetime as dt
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import threading
@@ -20,25 +20,25 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-BINANCE_API = "https://fapi.binance.com"
-INTERVALS = ("5m", "15m")
-KLINE_LIMIT = 210   # 2 request-weight units per symbol/interval (100 <= limit < 500)
-MIN_CANDLES = 100  # enough warm-up to keep MACD near TradingView's long-history EMA
-WARMUP_INDEX = 75  # ignore initial bars where EMA seeding can influence zero crosses
+API_URL = "https://api.bybit.com"
+INTERVAL_MINUTES = {"5m": 5, "15m": 15}
+KLINE_LIMIT = 240
+MIN_CANDLES = 100
+WARMUP_INDEX = 75
 CLOSE_GRACE_MS = 2500
-RPS = float(os.environ.get("BINANCE_REQUESTS_PER_SECOND", "7"))
+RPS = float(os.environ.get("BYBIT_REQUESTS_PER_SECOND", "7"))
 WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
 STATE_PATH = Path(os.environ.get("STATE_PATH", ".state/state.json"))
 HTTP_TIMEOUT = 18
-LOG = logging.getLogger("macd-scanner")
+LOG = logging.getLogger("bybit-macd")
 
 
 class RequestLimiter:
-    """Process-wide request pacing; Binance rate limits are by *shared public IP*."""
+    """Share request pacing and cooldown between all scanner threads."""
 
     def __init__(self, rps: float):
-        if rps <= 0 or rps > 10:
-            raise ValueError("BINANCE_REQUESTS_PER_SECOND must be in (0, 10]")
+        if not 0 < rps <= 10:
+            raise ValueError("BYBIT_REQUESTS_PER_SECOND must be in (0, 10]")
         self.delay = 1.0 / rps
         self.lock = threading.Lock()
         self.next_slot = 0.0
@@ -62,66 +62,112 @@ class RequestLimiter:
 LIMITER = RequestLimiter(RPS)
 
 
-def _request_json(url: str, method="GET", payload=None, *, binance=False):
-    body = None if payload is None else json.dumps(payload).encode("utf-8")
-    headers = {"User-Agent": "github-macd-zero-scanner/1.0", "Accept": "application/json"}
-    if body is not None:
+def _request_json(url: str, *, method: str = "GET", payload=None, bybit=False) -> dict:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {"Accept": "application/json", "User-Agent": "bybit-macd-zero-telegram/1.0"}
+    if data is not None:
         headers["Content-Type"] = "application/json"
-    safe_url = ("https://api.telegram.org/bot<redacted>/sendMessage"
-                if url.startswith("https://api.telegram.org/bot") else url.split("?")[0])
-    retries = 5
-    for attempt in range(retries):
-        if binance:
+    safe_url = ("Telegram sendMessage" if "api.telegram.org/bot" in url
+                else url.split("?", 1)[0])
+    for attempt in range(5):
+        if bybit:
             LIMITER.wait()
-        request = urllib.request.Request(url, data=body, headers=headers, method=method)
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT) as response:
-                return json.load(response)
+            with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as response:
+                result = json.load(response)
+            if bybit:
+                code = result.get("retCode")
+                if code != 0:
+                    if code in (10006, 10000, 10016, 429) and attempt < 4:
+                        delay = min(60, 5 * (2 ** attempt))
+                        LIMITER.pause_all(delay)
+                        LOG.warning("Bybit retCode %s for %s; retry in %ss", code, safe_url, delay)
+                        continue
+                    if code == 10009:
+                        raise RuntimeError("Bybit API restricted in this runner's region (retCode 10009)")
+                    raise RuntimeError(f"Bybit retCode {code} for {safe_url}: {result.get('retMsg', '')}")
+            return result
         except urllib.error.HTTPError as exc:
             status = exc.code
-            error_body = exc.read(350).decode("utf-8", errors="replace")
-            if binance and status == 451:
+            body = exc.read(250).decode("utf-8", errors="replace")
+            if bybit and status == 403:
                 raise RuntimeError(
-                    "Binance Futures returned HTTP 451: market data blocked for this "
-                    "GitHub runner's IP/region. GitHub-hosted runners may be in a "
-                    "restricted location. A compliant runner with access to Binance "
-                    "is required."
+                    "Bybit API returned HTTP 403: access blocked for this GitHub runner's "
+                    "IP/region or IP rate limit. Bybit restricts some regions. "
+                    "Do not repeatedly retry a blocked IP."
                 ) from exc
-            if binance and status == 418:
-                raise RuntimeError("Binance temporary IP ban (HTTP 418); stopping requests") from exc
-            if status in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                retry_after = exc.headers.get("Retry-After", "")
+            if status in (429, 500, 502, 503, 504) and attempt < 4:
                 try:
-                    delay = float(retry_after)
-                except ValueError:
-                    delay = min(65, 2 ** (attempt + 2))
-                delay = max(5.0, min(delay, 180.0))
-                if binance:
-                    LIMITER.pause_all(delay if status != 429 else max(30.0, delay))
+                    delay = float(exc.headers.get("Retry-After", ""))
+                except (ValueError, TypeError):
+                    delay = min(60, 5 * (2 ** attempt))
+                delay = max(5.0, min(90.0, delay))
+                if bybit:
+                    LIMITER.pause_all(delay)
                 else:
                     time.sleep(delay)
-                LOG.warning("HTTP %s; retrying %s in %.1fs", status, safe_url, delay)
+                LOG.warning("HTTP %d for %s; retry in %.1fs", status, safe_url, delay)
                 continue
-            raise RuntimeError(f"HTTP {status} for {safe_url}: {error_body}") from exc
+            raise RuntimeError(f"HTTP {status} for {safe_url}: {body}") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            if attempt == retries - 1:
-                raise RuntimeError(f"Network failure: {safe_url}: {exc}") from exc
-            time.sleep(min(16, 2 ** attempt))
-    raise RuntimeError("Unexpected retry loop exit")
+            if attempt == 4:
+                raise RuntimeError(f"Network error for {safe_url}: {exc}") from exc
+            time.sleep(min(12, 2 ** attempt))
+    raise RuntimeError(f"Too many retries: {safe_url}")
 
 
-def binance_get(path: str, params: dict | None = None):
-    url = BINANCE_API + path
+def bybit_get(path: str, params: dict | None = None) -> dict:
+    url = API_URL + path
     if params:
         url += "?" + urllib.parse.urlencode(params)
-    return _request_json(url, binance=True)
+    return _request_json(url, bybit=True)
+
+
+def get_server_ms() -> int:
+    payload = bybit_get("/v5/market/time")
+    if payload.get("time") is not None:
+        return int(payload["time"])
+    return int(payload["result"]["timeSecond"]) * 1000
+
+
+def get_symbols() -> list[str]:
+    """Get ALL Trading USDT-settled linear perpetuals, handling pagination."""
+    symbols = set()
+    cursor = ""
+    seen_cursors = set()
+    while True:
+        params = {"category": "linear", "status": "Trading", "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+        result = bybit_get("/v5/market/instruments-info", params)["result"]
+        instruments = result["list"]
+        if not isinstance(instruments, list):
+            raise RuntimeError("Bybit returned an invalid instrument list")
+        for item in instruments:
+            if (item.get("status") == "Trading"
+                    and item.get("contractType") == "LinearPerpetual"
+                    and item.get("quoteCoin") == "USDT"
+                    and item.get("settleCoin") == "USDT"
+                    and not item.get("isPreListing", False)):
+                symbols.add(item["symbol"])
+        next_cursor = result.get("nextPageCursor") or ""
+        if not next_cursor:
+            break
+        if next_cursor in seen_cursors:
+            raise RuntimeError("Bybit instrument pagination cursor repeated")
+        seen_cursors.add(next_cursor)
+        cursor = next_cursor
+    if not symbols:
+        raise RuntimeError("Bybit returned no Trading USDT perpetual contracts")
+    return sorted(symbols)
 
 
 def ema(values: list[float], length: int) -> list[float]:
     if not values:
         return []
-    alpha = 2.0 / (length + 1)
-    out = [values[0]]  # matches ta.ema-style first-sample initialization
+    alpha = 2 / (length + 1)
+    out = [values[0]]
     for value in values[1:]:
         out.append(alpha * value + (1 - alpha) * out[-1])
     return out
@@ -143,17 +189,23 @@ def crossing(before: float, after: float) -> str | None:
     return None
 
 
-def format_utc(ms: int) -> str:
-    return dt.datetime.fromtimestamp(ms / 1000, tz=dt.timezone.utc).strftime("%d.%m %H:%M UTC")
+def format_utc(milliseconds: int) -> str:
+    return dt.datetime.fromtimestamp(milliseconds / 1000, tz=dt.timezone.utc).strftime("%d.%m %H:%M UTC")
+
+
+def latest_closed_boundary(server_ms: int, interval: str) -> int:
+    period = INTERVAL_MINUTES[interval] * 60_000
+    return ((server_ms - CLOSE_GRACE_MS) // period) * period
 
 
 def load_state() -> dict:
-    if not STATE_PATH.is_file():
-        LOG.info("Previous state not found: initial synchronization (no historical alerts).")
-        return {"version": 1, "last": {}}
+    if not STATE_PATH.exists():
+        LOG.info("No previous Bybit state: first run initializes checkpoints without historical alerts")
+        return {"version": 2, "exchange": "bybit", "last": {}}
     state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    if state.get("version") != 1 or not isinstance(state.get("last"), dict):
-        raise ValueError("Invalid state schema")
+    if (state.get("version") != 2 or state.get("exchange") != "bybit"
+            or not isinstance(state.get("last"), dict)):
+        raise RuntimeError("Invalid state schema: need Bybit state version 2, not Binance state")
     return state
 
 
@@ -169,15 +221,15 @@ class Alert:
     symbol: str
     interval: str
     direction: str
-    candle_close_ms: int  # exclusive close boundary: closeTime + 1
+    candle_close_ms: int
     old_macd: float
     new_macd: float
 
     def display(self) -> str:
         icon = "🟢" if self.direction == "LONG" else "🔴"
-        chart_symbol = urllib.parse.quote("BINANCE:" + self.symbol + ".P", safe="")
-        tv_min = "5" if self.interval == "5m" else "15"
-        chart = f"https://www.tradingview.com/chart/?symbol={chart_symbol}&interval={tv_min}"
+        chart_symbol = urllib.parse.quote("BYBIT:" + self.symbol + ".P", safe="")
+        timeframe = INTERVAL_MINUTES[self.interval]
+        chart = f"https://www.tradingview.com/chart/?symbol={chart_symbol}&interval={timeframe}"
         return (
             f"{icon} {self.direction} | {self.symbol} | {self.interval}\n"
             f"Закрытие: {format_utc(self.candle_close_ms)}\n"
@@ -187,42 +239,49 @@ class Alert:
 
 
 def scan_symbol(symbol: str, interval: str, server_ms: int, last_ms: int | None):
-    raw = binance_get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": KLINE_LIMIT})
+    """Fetch Bybit newest-first candles, reverse, exclude forming candles, scan after checkpoint."""
+    period = INTERVAL_MINUTES[interval] * 60_000
+    result = bybit_get("/v5/market/kline", {
+        "category": "linear", "symbol": symbol,
+        "interval": str(INTERVAL_MINUTES[interval]), "limit": KLINE_LIMIT,
+    })["result"]
+    raw = result["list"]
     if not isinstance(raw, list):
-        raise RuntimeError(f"Unexpected klines payload for {symbol} {interval}")
-    candles = [row for row in raw if int(row[6]) + 1 <= server_ms - CLOSE_GRACE_MS]
+        raise RuntimeError(f"Invalid klines payload for {symbol} {interval}")
+    # Bybit V5 returns newest first; each candle timestamp is its START, not close.
+    candles = sorted(
+        ((int(row[0]), float(row[4])) for row in raw
+         if int(row[0]) + period <= server_ms - CLOSE_GRACE_MS),
+        key=lambda candle: candle[0],
+    )
     if len(candles) < MIN_CANDLES:
-        # Newly listed instruments are checked again next run; no fabricated MACD.
         return [], None, "young"
-    closes = [float(row[4]) for row in candles]
-    if not all(x > 0 for x in closes):
-        raise ValueError(f"Unexpected nonpositive close: {symbol} {interval}")
-    macd_line, _ = macd(closes)
-    newest_close = int(candles[-1][6]) + 1
+    if any(not math.isfinite(close) or close <= 0 for _, close in candles):
+        raise ValueError(f"Invalid candle close for {symbol} {interval}")
+    if any(candles[i][0] <= candles[i - 1][0] for i in range(1, len(candles))):
+        raise ValueError(f"Repeated candle time for {symbol} {interval}")
+    closes = [c for _, c in candles]
+    line, _ = macd(closes)
+    newest_close = candles[-1][0] + period
     if last_ms is None:
         return [], newest_close, "bootstrapped"
-
-    earliest_usable_close = int(candles[WARMUP_INDEX][6]) + 1
-    if last_ms < earliest_usable_close:
-        LOG.warning(
-            "%s %s: previous state too old for full backfill; oldest scan date %s",
-            symbol, interval, format_utc(earliest_usable_close),
-        )
+    earliest = candles[WARMUP_INDEX][0] + period
+    if last_ms < earliest:
+        LOG.warning("%s %s: checkpoint too old, scanning from %s", symbol, interval, format_utc(earliest))
     alerts = []
-    for i in range(WARMUP_INDEX, len(candles)):
-        t = int(candles[i][6]) + 1
-        if t <= last_ms:
+    for index in range(WARMUP_INDEX, len(candles)):
+        close_ms = candles[index][0] + period
+        if close_ms <= last_ms:
             continue
-        direction = crossing(macd_line[i - 1], macd_line[i])
+        direction = crossing(line[index - 1], line[index])
         if direction:
-            alerts.append(Alert(symbol, interval, direction, t, macd_line[i - 1], macd_line[i]))
+            alerts.append(Alert(symbol, interval, direction, close_ms, line[index - 1], line[index]))
     return alerts, newest_close, "ok"
 
 
 def group_messages(alerts: list[Alert]) -> list[str]:
-    """Send all alerts, grouping within Telegram's 4096-character limit."""
+    header = "Bybit MACD (12,26,9): пересечение нуля на закрытой свече\n"
     messages = []
-    header = "MACD (12,26,9): пересечение нуля на закрытой свече\n"
     current = header
     for alert in alerts:
         entry = "\n" + alert.display() + "\n"
@@ -240,7 +299,7 @@ def telegram_send(token: str, chat_id: str, message: str):
     data = {"chat_id": chat_id, "text": message, "disable_web_page_preview": True}
     response = _request_json(endpoint, method="POST", payload=data)
     if not response.get("ok"):
-        raise RuntimeError(f"Telegram rejected message: {response.get('description', 'unknown error')}")
+        raise RuntimeError(f"Telegram error: {response.get('description', 'unknown')}")
 
 
 def main():
@@ -248,78 +307,79 @@ def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
-        raise RuntimeError("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Actions secrets")
+        raise RuntimeError("Configure TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub repository secrets")
+    if not 1 <= WORKERS <= 12:
+        raise ValueError("MAX_WORKERS must be in [1,12]")
 
     state = load_state()
     old_last = state["last"]
-    # Fetch server time once to freeze the universe of *closed* candles for this run.
-    server_ms = int(binance_get("/fapi/v1/time")["serverTime"])
-    info = binance_get("/fapi/v1/exchangeInfo")
-    symbols = sorted({
-        item["symbol"] for item in info["symbols"]
-        if item.get("status") == "TRADING" and item.get("quoteAsset") == "USDT"
-    })
-    if not symbols:
-        raise RuntimeError("No TRADING USDT futures returned by Binance")
-    LOG.info("Found %d active USDT futures; scan = %d pairs", len(symbols), len(symbols) * len(INTERVALS))
+    server_ms = get_server_ms()
+    symbols = get_symbols()
+    LOG.info("Bybit: %d active USDT perpetual symbols", len(symbols))
 
-    # Carry prior checkpoints for all symbols. Only successfully checked pairs advance.
     new_last = dict(old_last)
     alerts: list[Alert] = []
     errors = []
     young = 0
     bootstrapped = 0
+    skipped = 0
+    tasks = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as executor:
-        futures = {}
         for symbol in symbols:
-            for interval in INTERVALS:
+            for interval in INTERVAL_MINUTES:
                 key = f"{symbol}|{interval}"
-                fut = executor.submit(scan_symbol, symbol, interval, server_ms, old_last.get(key))
-                futures[fut] = key
-        for idx, fut in enumerate(concurrent.futures.as_completed(futures), 1):
-            key = futures[fut]
+                last_ms = old_last.get(key)
+                # A 15m candle changes only every 15 minutes. Skip unnecessary calls.
+                if last_ms is not None and last_ms >= latest_closed_boundary(server_ms, interval):
+                    skipped += 1
+                    continue
+                fut = executor.submit(scan_symbol, symbol, interval, server_ms, last_ms)
+                tasks[fut] = key
+        for index, fut in enumerate(concurrent.futures.as_completed(tasks), start=1):
+            key = tasks[fut]
             try:
                 batch, newest_ms, status = fut.result()
             except Exception as exc:
                 errors.append((key, str(exc)))
-                LOG.error("Scan failed %s: %s", key, exc)
+                LOG.error("Failed %s: %s", key, exc)
                 continue
             if newest_ms is not None:
                 new_last[key] = newest_ms
             alerts.extend(batch)
             young += status == "young"
             bootstrapped += status == "bootstrapped"
-            if idx % 200 == 0:
-                LOG.info("Scanned %s/%s pairs", idx, len(futures))
+            if index % 200 == 0:
+                LOG.info("Processed %d/%d requested pairs", index, len(tasks))
 
-    total = len(futures)
-    LOG.info("Done: %d scanned, %d errors, %d young, %d baseline, %d alerts",
-             total, len(errors), young, bootstrapped, len(alerts))
-    if len(errors) > max(10, total // 5):
-        raise RuntimeError(f"Too many failed requests: {len(errors)}/{total}; state was NOT advanced")
+    count = len(tasks)
+    LOG.info("Processed: %d requested / %d skipped; %d errors, %d young, %d baseline, %d alerts",
+             count, skipped, len(errors), young, bootstrapped, len(alerts))
+    if count and len(errors) > max(10, count // 5):
+        raise RuntimeError(f"Too many failed Bybit requests: {len(errors)}/{count}. State NOT saved")
 
     alerts.sort(key=lambda x: (x.candle_close_ms, x.interval, x.symbol))
     messages = group_messages(alerts)
     if not old_last:
-        # A successful initial bootstrap is otherwise silent, which looks broken.
         messages.insert(0,
-            f"✅ Сканер MACD запущен.\n"
-            f"Активных USDT-фьючерсов: {len(symbols)}.\n"
-            f"Таймфреймы: 5m, 15m.\n"
-            "Первый запуск синхронизирует историю; сигналы придут по следующим закрытым свечам."
-            + (f"\nНе удалось проверить пар: {len(errors)}; сканер повторит попытку." if errors else "")
-        )
-    for index, message in enumerate(messages):
-        if index:
-            time.sleep(1.2)  # Telegram: roughly <=1 message/s per private chat
+            f"✅ Bybit MACD-сканер запущен.\n"
+            f"Активных USDT Perpetual: {len(symbols)}\n"
+            "Таймфреймы: 5m, 15m\n"
+            "Первый запуск: только синхронизация. Сигналы начнутся со следующих закрытых свечей."
+            + (f"\nОшибок проверки: {len(errors)}" if errors else ""))
+    # A network/persistence failure AFTER Telegram delivery can lead to a duplicate
+    # on retry. Exactly-once delivery across external APIs is not mathematically guaranteed.
+    for i, message in enumerate(messages):
+        if i:
+            time.sleep(1.2)
         telegram_send(token, chat_id, message)
-    # Write AFTER delivery. If Telegram fails, state artifact won't upload; retry later.
+
     state["last"] = new_last
     state["updated_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
     save_state(state)
-    LOG.info("Saved %d checkpoints to %s; sent %d Telegram messages", len(new_last), STATE_PATH, len(messages))
+    LOG.info("Saved %d Bybit checkpoints to %s; Telegram messages: %d",
+             len(new_last), STATE_PATH, len(messages))
     if errors:
-        LOG.warning("%d pairs failed; their checkpoint was left unchanged for recovery", len(errors))
+        LOG.warning("Failed pairs kept their previous checkpoints and will be retried")
 
 
 if __name__ == "__main__":
