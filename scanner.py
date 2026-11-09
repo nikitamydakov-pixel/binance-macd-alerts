@@ -21,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass
 
 API_URL = "https://api.bybit.com"
-INTERVAL_MINUTES = {"5m": 5, "15m": 15}
+INTERVAL_MINUTES = {"15m": 15}
 KLINE_LIMIT = 240
 MIN_CANDLES = 100
 WARMUP_INDEX = 75
@@ -363,7 +363,7 @@ def main():
         messages.insert(0,
             f"✅ Bybit MACD-сканер запущен.\n"
             f"Активных USDT Perpetual: {len(symbols)}\n"
-            "Таймфреймы: 5m, 15m\n"
+            "Таймфреймы: 15m\n"
             "Первый запуск: только синхронизация. Сигналы начнутся со следующих закрытых свечей."
             + (f"\nОшибок проверки: {len(errors)}" if errors else ""))
     # A network/persistence failure AFTER Telegram delivery can lead to a duplicate
