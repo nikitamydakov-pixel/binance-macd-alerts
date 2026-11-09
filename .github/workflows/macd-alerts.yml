@@ -24,20 +24,23 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     timeout-minutes: 15
 
+    defaults:
+      run:
+        shell: powershell
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Verify locally installed Python 3.12
-        shell: pwsh
         run: |
           py -3.12 --version
+
           if ($LASTEXITCODE -ne 0) {
             throw 'Python 3.12 is not installed.'
           }
 
       - name: Set persistent Bybit checkpoint path
-        shell: pwsh
         env:
           RESET_STATE: ${{ inputs.reset_state }}
         run: |
@@ -52,12 +55,12 @@ jobs:
             Write-Host 'Bybit checkpoint manually reset.'
           }
 
-          "STATE_PATH=$stateFile" >> $env:GITHUB_ENV
+          "STATE_PATH=$stateFile" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           Write-Host "Checkpoint location: $stateFile"
 
       - name: Scan Bybit MACD and send Telegram alerts
-        shell: pwsh
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -66,6 +69,7 @@ jobs:
 
         run: |
           py -3.12 scanner.py
+
           if ($LASTEXITCODE -ne 0) {
             throw 'MACD scanner failed.'
           }
