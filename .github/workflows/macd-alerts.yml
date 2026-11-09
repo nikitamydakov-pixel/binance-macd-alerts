@@ -4,10 +4,11 @@ name: Bybit MACD Zero Line Scanner (Windows)
 on:
   schedule:
     - cron: '2-59/5 * * * *'
+
   workflow_dispatch:
     inputs:
       reset_state:
-        description: 'Forget previous Bybit MACD checkpoints (no historical alerts)'
+        description: 'Reset previous MACD checkpoints'
         type: boolean
         default: false
 
@@ -22,14 +23,18 @@ jobs:
   scan:
     runs-on: [self-hosted, windows, x64]
     timeout-minutes: 15
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Verify locally installed Python 3.12
+        shell: pwsh
+        run: |
+          py -3.12 --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Python 3.12 is not installed.'
+          }
 
       - name: Set persistent Bybit checkpoint path
         shell: pwsh
@@ -37,20 +42,30 @@ jobs:
           RESET_STATE: ${{ inputs.reset_state }}
         run: |
           $stateDir = Join-Path $env:USERPROFILE 'bybit-macd-state'
+
           New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
+
           $stateFile = Join-Path $stateDir 'state.json'
+
           if ($env:RESET_STATE -eq 'true' -and (Test-Path $stateFile)) {
             Remove-Item -Path $stateFile -Force
             Write-Host 'Bybit checkpoint manually reset.'
           }
+
           "STATE_PATH=$stateFile" >> $env:GITHUB_ENV
+
           Write-Host "Checkpoint location: $stateFile"
 
       - name: Scan Bybit MACD and send Telegram alerts
+        shell: pwsh
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           BYBIT_REQUESTS_PER_SECOND: '7'
           MAX_WORKERS: '8'
-        shell: pwsh
-        run: python scanner.py
+
+        run: |
+          py -3.12 scanner.py
+          if ($LASTEXITCODE -ne 0) {
+            throw 'MACD scanner failed.'
+          }
