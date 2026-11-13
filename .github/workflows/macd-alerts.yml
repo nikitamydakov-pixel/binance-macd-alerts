@@ -1,5 +1,5 @@
 
-name: Bybit MACD Zero Line Scanner (Windows)
+name: BingX MACD Zero Line Scanner (Windows)
 
 on:
   schedule:
@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       reset_state:
-        description: 'Reset previous MACD checkpoints'
+        description: 'Reset BingX MACD checkpoints'
         type: boolean
         default: false
 
@@ -16,13 +16,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: bybit-macd-zero-scanner
+  group: bingx-macd-zero-scanner
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: [self-hosted, windows, x64]
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     defaults:
       run:
@@ -40,36 +40,35 @@ jobs:
             throw 'Python 3.12 is not installed.'
           }
 
-      - name: Set persistent Bybit checkpoint path
+      - name: Set BingX persistent checkpoint
         env:
           RESET_STATE: ${{ inputs.reset_state }}
         run: |
-          $stateDir = Join-Path $env:USERPROFILE 'bybit-macd-state'
-
+          $stateDir = Join-Path $env:USERPROFILE 'bingx-macd-state'
           New-Item -ItemType Directory -Path $stateDir -Force | Out-Null
 
           $stateFile = Join-Path $stateDir 'state.json'
 
           if ($env:RESET_STATE -eq 'true' -and (Test-Path $stateFile)) {
             Remove-Item -Path $stateFile -Force
-            Write-Host 'Bybit checkpoint manually reset.'
+            Write-Host 'BingX checkpoints reset.'
           }
 
           "STATE_PATH=$stateFile" |
             Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-          Write-Host "Checkpoint location: $stateFile"
+          Write-Host "Checkpoint: $stateFile"
 
-      - name: Scan Bybit MACD and send Telegram alerts
+      - name: Scan BingX MACD and send Telegram alerts
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BYBIT_REQUESTS_PER_SECOND: '7'
-          MAX_WORKERS: '8'
+          BINGX_REQUESTS_PER_SECOND: '1'
+          MAX_WORKERS: '6'
 
         run: |
           py -3.12 scanner.py
 
           if ($LASTEXITCODE -ne 0) {
-            throw 'MACD scanner failed.'
+            throw 'BingX MACD scanner failed.'
           }
