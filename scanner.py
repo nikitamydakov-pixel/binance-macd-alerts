@@ -1,6 +1,12 @@
 
 #!/usr/bin/env python3
-"""BingX MACD 15m zero-line Telegram scanner."""
+"""BingX perpetual MACD zero-cross alerts, 15m.
+
+Signal: MACD(12,26,9) crosses zero, provided that
+max(abs(MACD)) >= 1.5 * max(abs(MACD - signal))
+on closed candles between the previous and current
+zero crossings.
+"""
 
 from __future__ import annotations
 
@@ -26,28 +32,23 @@ from pathlib import Path
 
 API_URL = "https://open-api.bingx.com"
 
-# Только 15 минут
 INTERVAL = "15m"
 PERIOD_MS = 15 * 60_000
 
-# Минимальный оборот за 24 часа
 MIN_TURNOVER_24H_USDT = 1_000_000.0
 
-# MACD (12, 26, 9)
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-# Минимальное соотношение MACD и гистограммы
-MACD_HIST_MIN_RATIO = 1.5
+# Минимальное отношение экстремумов
+EXTREMA_MIN_RATIO = 1.5
 
-# Глубина истории
 KLINE_LIMIT = 1000
 MIN_CANDLES = 100
 WARMUP_INDEX = 75
 CLOSE_GRACE_MS = 2500
 
-# Ограничения BingX API
 RPS = float(
     os.getenv("BINGX_REQUESTS_PER_SECOND", "1")
 )
@@ -68,91 +69,88 @@ STATE_PATH = Path(
 )
 
 HTTP_TIMEOUT = 20
-
 LOG = logging.getLogger("bingx-macd")
 
 
 # ========================================
-# ОГРАНИЧИТЕЛЬ ЗАПРОСОВ
+# ОГРАНИЧЕНИЕ ЗАПРОСОВ
 # ========================================
 
-class RequestLimiter:
+class RateLimiter:
 
     def __init__(self, rps: float):
 
         if not 0 < rps <= 10:
             raise ValueError(
-                "Invalid requests per second"
+                "BINGX_REQUESTS_PER_SECOND "
+                "must be between 0 and 10"
             )
 
-        self.delay = 1.0 / rps
+        self.delay = 1 / rps
         self.lock = threading.Lock()
-        self.next_slot = 0.0
+        self.next_at = 0.0
         self.blocked_until = 0.0
 
     def wait(self):
 
         with self.lock:
             now = time.monotonic()
-
             deadline = max(
                 now,
-                self.next_slot,
+                self.next_at,
                 self.blocked_until
             )
-
-            self.next_slot = deadline + self.delay
+            self.next_at = deadline + self.delay
 
         if deadline > now:
             time.sleep(deadline - now)
 
-    def pause_all(self, seconds: float):
+    def cooldown(self, seconds: float):
 
         with self.lock:
             self.blocked_until = max(
                 self.blocked_until,
                 time.monotonic() + seconds
             )
-
-            self.next_slot = max(
-                self.next_slot,
+            self.next_at = max(
+                self.next_at,
                 self.blocked_until
             )
 
 
-LIMITER = RequestLimiter(RPS)
+LIMITER = RateLimiter(RPS)
 
 
 # ========================================
-# HTTP-ЗАПРОСЫ
+# HTTP И BINGX API
 # ========================================
 
 def request_json(
     url: str,
     *,
     bingx=False,
-    post=None
-):
+    payload=None
+) -> dict:
+
+    body = (
+        None
+        if payload is None
+        else json.dumps(payload).encode("utf-8")
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "bingx-macd-extrema/1.0"
+    }
+
+    if body is not None:
+        headers["Content-Type"] = "application/json"
 
     safe_url = (
         "Telegram sendMessage"
         if "api.telegram.org/bot" in url
         else url.split("?", 1)[0]
     )
-
-    payload = (
-        None
-        if post is None
-        else json.dumps(post).encode("utf-8")
-    )
-
-    headers = {
-        "User-Agent": "bingx-macd-15m-telegram/1.0",
-        "Accept": "application/json"
-    }
-
-    if post is not None:
-        headers["Content-Type"] = "application/json"
 
     for attempt in range(5):
 
@@ -161,86 +159,91 @@ def request_json(
 
         req = urllib.request.Request(
             url,
-            data=payload,
+            data=body,
             headers=headers,
-            method="POST" if post is not None else "GET"
+            method=(
+                "POST"
+                if body is not None
+                else "GET"
+            )
         )
 
         try:
-
             with urllib.request.urlopen(
                 req,
                 timeout=HTTP_TIMEOUT
             ) as response:
-                result = json.load(response)
+                data = json.load(response)
 
-            if bingx:
+            if (
+                bingx
+                and str(data.get("code", "missing")) != "0"
+            ):
 
-                code = str(
-                    result.get("code", "missing")
+                code = str(data.get("code"))
+
+                if (
+                    code in {
+                        "100410",
+                        "100500",
+                        "109500"
+                    }
+                    and attempt < 4
+                ):
+                    delay = min(
+                        60,
+                        5 * 2**attempt
+                    )
+                    LIMITER.cooldown(delay)
+
+                    LOG.warning(
+                        "BingX code %s; cooldown %ss",
+                        code,
+                        delay
+                    )
+                    continue
+
+                raise RuntimeError(
+                    f"BingX API code {code}: "
+                    f"{data.get('msg', '')}"
                 )
 
-                if code != "0":
-
-                    if (
-                        code in (
-                            "100410",
-                            "100500",
-                            "109500"
-                        )
-                        and attempt < 4
-                    ):
-
-                        delay = min(
-                            60,
-                            5 * 2 ** attempt
-                        )
-
-                        LIMITER.pause_all(delay)
-
-                        LOG.warning(
-                            "BingX code %s; retry after %ss",
-                            code,
-                            delay
-                        )
-
-                        continue
-
-                    raise RuntimeError(
-                        f"BingX {code}: "
-                        f"{result.get('msg', '')}"
-                    )
-
-            return result
+            return data
 
         except urllib.error.HTTPError as exc:
 
             if (
-                exc.code in (
+                exc.code in {
                     429, 500, 502, 503, 504
-                )
+                }
                 and attempt < 4
             ):
-
                 delay = min(
                     60,
-                    5 * 2 ** attempt
+                    5 * 2**attempt
                 )
 
                 if bingx:
-                    LIMITER.pause_all(delay)
+                    LIMITER.cooldown(delay)
                 else:
                     time.sleep(delay)
 
+                LOG.warning(
+                    "HTTP %d at %s; cooldown %ss",
+                    exc.code,
+                    safe_url,
+                    delay
+                )
                 continue
 
-            body = exc.read(150).decode(
+            detail = exc.read(200).decode(
                 "utf-8",
-                errors="replace"
+                "replace"
             )
 
             raise RuntimeError(
-                f"HTTP {exc.code} at {safe_url}: {body}"
+                f"HTTP {exc.code} "
+                f"at {safe_url}: {detail}"
             ) from exc
 
         except (
@@ -251,19 +254,22 @@ def request_json(
 
             if attempt == 4:
                 raise RuntimeError(
-                    f"Network error: {exc}"
+                    f"Network error at "
+                    f"{safe_url}: {exc}"
                 ) from exc
 
-            time.sleep(min(12, 2 ** attempt))
+            time.sleep(
+                min(12, 2**attempt)
+            )
 
     raise RuntimeError(
-        "Too many request retries"
+        f"Too many retries for {safe_url}"
     )
 
 
 def bingx_get(
     path: str,
-    params=None
+    params: dict | None = None
 ):
 
     url = API_URL + path
@@ -283,26 +289,27 @@ def bingx_get(
 
 def get_server_ms() -> int:
 
-    data = bingx_get(
+    value = bingx_get(
         "/openApi/swap/v2/server/time"
     )
 
     if (
-        isinstance(data, dict)
-        and data.get("serverTime") is not None
+        isinstance(value, dict)
+        and value.get("serverTime") is not None
     ):
-        return int(data["serverTime"])
+        return int(value["serverTime"])
 
-    if isinstance(data, (int, str)):
-        return int(data)
+    if isinstance(value, (int, str)):
+        return int(value)
 
     raise RuntimeError(
-        "Unexpected BingX server time"
+        f"Unexpected BingX time format: "
+        f"{str(value)[:100]}"
     )
 
 
 # ========================================
-# МОНЕТЫ С ОБОРОТОМ ОТ 1 МЛН USDT
+# ФИЛЬТР ОБОРОТА ОТ 1 МЛН USDT
 # ========================================
 
 def get_liquid_symbols() -> tuple[list[str], int]:
@@ -311,30 +318,33 @@ def get_liquid_symbols() -> tuple[list[str], int]:
         "/openApi/swap/v2/quote/contracts"
     )
 
-    if not isinstance(contracts, list) or not contracts:
+    if (
+        not isinstance(contracts, list)
+        or not contracts
+    ):
         raise RuntimeError(
-            "BingX contract list missing"
+            "BingX returned no contracts"
         )
 
     active = {
-        c["symbol"]
-        for c in contracts
+        item["symbol"]
+        for item in contracts
         if (
-            isinstance(c, dict)
-            and str(c.get("status")) == "1"
-            and c.get("currency") == "USDT"
+            isinstance(item, dict)
+            and str(item.get("status")) == "1"
+            and item.get("currency") == "USDT"
             and str(
-                c.get("symbol", "")
+                item.get("symbol", "")
             ).endswith("-USDT")
             and not str(
-                c.get("symbol", "")
+                item.get("symbol", "")
             ).startswith("NCS")
         )
     }
 
     if not active:
         raise RuntimeError(
-            "No active USDT perpetual contracts"
+            "No active USDT perpetuals"
         )
 
     tickers = bingx_get(
@@ -344,9 +354,12 @@ def get_liquid_symbols() -> tuple[list[str], int]:
     if isinstance(tickers, dict):
         tickers = [tickers]
 
-    if not isinstance(tickers, list) or not tickers:
+    if (
+        not isinstance(tickers, list)
+        or not tickers
+    ):
         raise RuntimeError(
-            "BingX ticker list missing"
+            "Invalid BingX ticker list"
         )
 
     liquid = set()
@@ -356,9 +369,7 @@ def get_liquid_symbols() -> tuple[list[str], int]:
         if not isinstance(ticker, dict):
             continue
 
-        symbol = ticker.get("symbol")
-
-        if symbol not in active:
+        if ticker.get("symbol") not in active:
             continue
 
         try:
@@ -366,9 +377,9 @@ def get_liquid_symbols() -> tuple[list[str], int]:
                 ticker["quoteVolume"]
             )
         except (
-            KeyError,
+            TypeError,
             ValueError,
-            TypeError
+            KeyError
         ):
             continue
 
@@ -376,15 +387,17 @@ def get_liquid_symbols() -> tuple[list[str], int]:
             math.isfinite(turnover)
             and turnover >= MIN_TURNOVER_24H_USDT
         ):
-            liquid.add(symbol)
+            liquid.add(ticker["symbol"])
 
     if not liquid:
         raise RuntimeError(
-            "No contracts passed turnover filter"
+            "No contracts passed 24-hour "
+            "USDT turnover filter"
         )
 
     LOG.info(
-        "BingX turnover >= %.0f USDT: %d/%d",
+        "Turnover >= %.0f USDT: "
+        "%d / %d active contracts",
         MIN_TURNOVER_24H_USDT,
         len(liquid),
         len(active)
@@ -394,58 +407,48 @@ def get_liquid_symbols() -> tuple[list[str], int]:
 
 
 # ========================================
-# РАСЧЁТ MACD
+# MACD (12, 26, 9)
 # ========================================
 
 def ema(
     values: list[float],
-    period: int
+    length: int
 ) -> list[float]:
 
     if not values:
         return []
 
-    alpha = 2 / (period + 1)
-
-    output = [values[0]]
+    alpha = 2.0 / (length + 1)
+    result = [values[0]]
 
     for value in values[1:]:
-        output.append(
+        result.append(
             alpha * value
-            + (1 - alpha) * output[-1]
+            + (1 - alpha) * result[-1]
         )
 
-    return output
+    return result
 
 
-def calculate_macd(
+def macd(
     closes: list[float]
-):
+) -> tuple[list[float], list[float]]:
 
     fast = ema(closes, MACD_FAST)
     slow = ema(closes, MACD_SLOW)
 
     line = [
-        a - b
-        for a, b in zip(fast, slow)
+        f - s
+        for f, s in zip(fast, slow)
     ]
 
-    signal = ema(
-        line,
-        MACD_SIGNAL
-    )
-
-    return line, signal
+    return line, ema(line, MACD_SIGNAL)
 
 
-# ========================================
-# ПЕРЕСЕЧЕНИЕ НУЛЕВОЙ ЛИНИИ
-# ========================================
-
-def direction_of_cross(
+def cross_direction(
     before: float,
     after: float
-):
+) -> str | None:
 
     if before <= 0 < after:
         return "LONG"
@@ -457,118 +460,143 @@ def direction_of_cross(
 
 
 # ========================================
-# НОВЫЙ ФИЛЬТР MACD / ГИСТОГРАММА
-# ВЕСЬ УЧАСТОК МЕЖДУ ПЕРЕСЕЧЕНИЯМИ НУЛЯ
+# НОВОЕ УСЛОВИЕ:
+# СРАВНЕНИЕ ЭКСТРЕМУМОВ
 # ========================================
 
-def qualifying_ratio(
+@dataclass(frozen=True)
+class Extremes:
+
+    macd_abs: float
+    histogram_abs: float
+    ratio: float
+
+    macd_bar: int
+    hist_bar: int
+    previous_cross_bar: int
+
+
+def find_extrema(
     line: list[float],
     signal: list[float],
-    index: int,
-    direction: str
-):
+    current_cross: int,
+    candles: list[tuple[int, float]]
+) -> Extremes | None:
 
     """
-    Находит предыдущее пересечение
-    нулевой линии MACD.
+    Находим предыдущее пересечение MACD нуля.
 
-    Затем проверяет ВСЕ закрытые свечи
-    от предыдущего пересечения нуля
-    до текущего пересечения.
+    Рассматриваем все свечи между предыдущим
+    и текущим пересечениями.
+
+    Экстремумы определяем независимо:
+
+    macd_extreme = max(abs(MACD))
+    hist_extreme = max(abs(MACD - Signal))
 
     Условие:
+    macd_extreme >= 1.5 * hist_extreme
 
-    |MACD| >= 1.5 * |MACD - Signal|
-
-    Достаточно одной подходящей свечи.
-
-    Если предыдущее пересечение
-    не найдено, сигнал отклоняется.
+    Предыдущее пересечение включается,
+    текущее пересечение исключается.
     """
 
-    if index <= WARMUP_INDEX:
-        return None
-
-    # Ищем предыдущее пересечение нуля
     previous_cross = None
 
+    # Ищем предыдущее пересечение нуля
     for j in range(
-        index - 1,
+        current_cross - 1,
         WARMUP_INDEX,
         -1
     ):
 
-        previous_direction = direction_of_cross(
+        direction = cross_direction(
             line[j - 1],
             line[j]
         )
 
-        if previous_direction is not None:
+        if direction is not None:
             previous_cross = j
             break
 
-    # Предыдущее пересечение не найдено
     if previous_cross is None:
         return None
 
-    # До LONG линия MACD была ниже нуля
-    # До SHORT линия MACD была выше нуля
-    old_side = (
-        -1 if direction == "LONG"
-        else 1
-    )
-
-    strongest = None
-
-    # Проверяем весь участок
-    # начиная с предыдущего пересечения
-    # и заканчивая свечой перед текущим
-
-    for j in range(
-        previous_cross,
-        index
+    # Не допускаем пропусков свечей
+    # между пересечениями
+    for k in range(
+        previous_cross + 1,
+        current_cross + 1
     ):
 
-        # Проверяем нужную сторону нуля
-        if old_side * line[j] <= 0:
-            continue
+        if (
+            candles[k][0] - candles[k - 1][0]
+            != PERIOD_MS
+        ):
+            return None
 
-        # Гистограмма MACD
-        histogram = (
+    # Весь участок между пересечениями
+    period = range(
+        previous_cross,
+        current_cross
+    )
+
+    # Индекс максимального модуля MACD
+    macd_bar = max(
+        period,
+        key=lambda j: abs(line[j])
+    )
+
+    # Индекс максимального модуля гистограммы
+    hist_bar = max(
+        period,
+        key=lambda j: abs(
             line[j] - signal[j]
         )
+    )
 
-        # Исключаем почти нулевую
-        # гистограмму
-        if abs(histogram) <= max(
-            1e-16,
-            abs(line[j]) * 1e-10
-        ):
-            continue
+    # Модули двух экстремумов
+    macd_extreme = abs(
+        line[macd_bar]
+    )
 
-        ratio = (
-            abs(line[j]) / abs(histogram)
-        )
+    histogram_extreme = abs(
+        line[hist_bar] - signal[hist_bar]
+    )
 
-        # Условие выполнено
-        if ratio >= MACD_HIST_MIN_RATIO:
+    if (
+        not math.isfinite(macd_extreme)
+        or not math.isfinite(histogram_extreme)
+    ):
+        return None
 
-            # Сохраняем максимальное
-            # значение на всём участке
-            if (
-                strongest is None
-                or ratio > strongest[0]
-            ):
-                strongest = (ratio, j)
+    # Защита от деления на ноль
+    if histogram_extreme <= 0:
+        return None
 
-    return strongest
+    ratio = (
+        macd_extreme / histogram_extreme
+    )
+
+    # Сравниваем именно экстремумы
+    if ratio < EXTREMA_MIN_RATIO:
+        return None
+
+    return Extremes(
+        macd_abs=macd_extreme,
+        histogram_abs=histogram_extreme,
+        ratio=ratio,
+        macd_bar=macd_bar,
+        hist_bar=hist_bar,
+        previous_cross_bar=previous_cross
+    )
 
 
 # ========================================
-# ВРЕМЯ
+# ВРЕМЯ И ЗАКРЫТЫЕ СВЕЧИ
 # ========================================
 
-def format_utc(ms: int):
+def time_utc(ms: int) -> str:
 
     return dt.datetime.fromtimestamp(
         ms / 1000,
@@ -578,7 +606,7 @@ def format_utc(ms: int):
 
 def latest_closed_boundary(
     server_ms: int
-):
+) -> int:
 
     return (
         (server_ms - CLOSE_GRACE_MS)
@@ -588,17 +616,17 @@ def latest_closed_boundary(
 
 
 # ========================================
-# СВЕЧИ BINGX 15m
+# ПОЛУЧЕНИЕ СВЕЧЕЙ BINGX
 # ========================================
 
 def parse_candles(
     raw,
     server_ms: int
-):
+) -> list[tuple[int, float]]:
 
     if not isinstance(raw, list):
         raise ValueError(
-            "Malformed BingX kline list"
+            "Invalid BingX kline response"
         )
 
     parsed = {}
@@ -611,13 +639,13 @@ def parse_candles(
 
                 stamp = next(
                     (
-                        row[key]
-                        for key in (
+                        row[k]
+                        for k in (
                             "time",
                             "openTime",
                             "startTime"
                         )
-                        if row.get(key) is not None
+                        if row.get(k) is not None
                     ),
                     None
                 )
@@ -635,17 +663,17 @@ def parse_candles(
 
             else:
                 raise ValueError(
-                    "Invalid candle format"
+                    "Unrecognized candle structure"
                 )
 
         except (
+            ValueError,
             KeyError,
-            TypeError,
-            ValueError
+            TypeError
         ) as exc:
 
             desc = (
-                sorted(row.keys())
+                sorted(row)
                 if isinstance(row, dict)
                 else type(row).__name__
             )
@@ -654,9 +682,9 @@ def parse_candles(
                 f"Malformed BingX candle: {desc}"
             ) from exc
 
-        if start % PERIOD_MS != 0:
+        if start % PERIOD_MS:
             raise ValueError(
-                f"Misaligned 15m candle: {start}"
+                f"Unaligned 15m candle {start}"
             )
 
         if (
@@ -664,10 +692,10 @@ def parse_candles(
             or close <= 0
         ):
             raise ValueError(
-                "Invalid candle close"
+                f"Invalid close at {start}"
             )
 
-        # Только закрытые свечи
+        # Исключаем текущую незакрытую свечу
         if (
             start + PERIOD_MS
             <= server_ms - CLOSE_GRACE_MS
@@ -678,7 +706,7 @@ def parse_candles(
 
 
 # ========================================
-# ФОРМАТ TELEGRAM-СИГНАЛА
+# TELEGRAM-СООБЩЕНИЕ
 # ========================================
 
 @dataclass(frozen=True)
@@ -687,43 +715,67 @@ class Alert:
     symbol: str
     direction: str
     candle_close_ms: int
+
     old_macd: float
     new_macd: float
-    ratio: float
-    condition_close_ms: int
+
+    extremes: Extremes
+    candles: list[tuple[int, float]]
 
     def display(self) -> str:
 
         icon = (
-            "🟢" if self.direction == "LONG"
+            "🟢"
+            if self.direction == "LONG"
             else "🔴"
         )
 
-        tv_symbol = urllib.parse.quote(
+        chart_symbol = urllib.parse.quote(
             "BINGX:"
             + self.symbol.replace("-", "")
             + ".P",
             safe=""
         )
 
-        tv = (
+        chart = (
             "https://www.tradingview.com/chart/"
-            f"?symbol={tv_symbol}&interval=15"
+            f"?symbol={chart_symbol}"
+            f"&interval=15"
+        )
+
+        e = self.extremes
+
+        macd_time = time_utc(
+            self.candles[e.macd_bar][0]
+            + PERIOD_MS
+        )
+
+        hist_time = time_utc(
+            self.candles[e.hist_bar][0]
+            + PERIOD_MS
+        )
+
+        previous_time = time_utc(
+            self.candles[e.previous_cross_bar][0]
+            + PERIOD_MS
         )
 
         return (
             f"{icon} {self.direction} | "
             f"{self.symbol} | 15m\n"
-            f"Закрытие: "
-            f"{format_utc(self.candle_close_ms)}\n"
+            f"Пересечение: "
+            f"{time_utc(self.candle_close_ms)}\n"
             f"MACD: {self.old_macd:.8g} "
             f"→ {self.new_macd:.8g}\n"
-            f"С прошлого пересечения "
-            f"|MACD|/|гистограмма|: "
-            f"{self.ratio:.2f}x\n"
-            f"Свеча условия: "
-            f"{format_utc(self.condition_close_ms)}\n"
-            f"График: {tv}"
+            f"Экстремум |MACD|: "
+            f"{e.macd_abs:.8g} ({macd_time})\n"
+            f"Экстремум |Histogram|: "
+            f"{e.histogram_abs:.8g} ({hist_time})\n"
+            f"Соотношение экстремумов: "
+            f"{e.ratio:.2f}x\n"
+            f"Предыдущее пересечение: "
+            f"{previous_time}\n"
+            f"График: {chart}"
         )
 
 
@@ -737,7 +789,6 @@ def scan_symbol(
     last_ms: int | None
 ):
 
-    # Получаем свечи 15m
     raw = bingx_get(
         "/openApi/swap/v3/quote/klines",
         {
@@ -755,34 +806,22 @@ def scan_symbol(
     if len(candles) < MIN_CANDLES:
         return [], None, "young"
 
-    closes = [
-        close
-        for _, close in candles
-    ]
-
-    line, signal = calculate_macd(closes)
+    line, signal = macd(
+        [close for _, close in candles]
+    )
 
     newest = (
         candles[-1][0] + PERIOD_MS
     )
 
-    # При первом запуске только синхронизация
+    # Первая проверка монеты
     if last_ms is None:
         return [], newest, "bootstrapped"
-
-    if (
-        last_ms
-        < candles[WARMUP_INDEX][0] + PERIOD_MS
-    ):
-        LOG.warning(
-            "%s: checkpoint older than available history",
-            symbol
-        )
 
     alerts = []
 
     for i in range(
-        WARMUP_INDEX,
+        WARMUP_INDEX + 1,
         len(candles)
     ):
 
@@ -794,48 +833,44 @@ def scan_symbol(
         if close_ms <= last_ms:
             continue
 
-        # Не пересекаем пропущенные свечи
+        # Пропуск свечи не считается
+        # подтверждённым пересечением
         if (
             candles[i][0] - candles[i - 1][0]
             != PERIOD_MS
         ):
             continue
 
-        direction = direction_of_cross(
+        direction = cross_direction(
             line[i - 1],
             line[i]
         )
 
-        if not direction:
+        if direction is None:
             continue
 
-        # Проверяем весь предыдущий участок
-        condition = qualifying_ratio(
+        # НОВОЕ УСЛОВИЕ: сравнение
+        # экстремумов двух индикаторов
+        extremes = find_extrema(
             line,
             signal,
             i,
-            direction
+            candles
         )
 
-        if condition is None:
-            continue
+        if extremes is not None:
 
-        ratio, qualifying_index = condition
-
-        alerts.append(
-            Alert(
-                symbol=symbol,
-                direction=direction,
-                candle_close_ms=close_ms,
-                old_macd=line[i - 1],
-                new_macd=line[i],
-                ratio=ratio,
-                condition_close_ms=(
-                    candles[qualifying_index][0]
-                    + PERIOD_MS
+            alerts.append(
+                Alert(
+                    symbol=symbol,
+                    direction=direction,
+                    candle_close_ms=close_ms,
+                    old_macd=line[i - 1],
+                    new_macd=line[i],
+                    extremes=extremes,
+                    candles=candles
                 )
             )
-        )
 
     return alerts, newest, "ok"
 
@@ -849,7 +884,8 @@ def load_state() -> dict:
     if not STATE_PATH.exists():
 
         LOG.info(
-            "First BingX run: initialization"
+            "No BingX state; first scan "
+            "creates checkpoints"
         )
 
         return {
@@ -870,7 +906,7 @@ def load_state() -> dict:
         or not isinstance(state.get("last"), dict)
     ):
         raise RuntimeError(
-            "Invalid BingX state"
+            "Invalid BingX checkpoint file"
         )
 
     return state
@@ -898,7 +934,7 @@ def save_state(state: dict):
 
 
 # ========================================
-# TELEGRAM API
+# ОТПРАВКА В TELEGRAM
 # ========================================
 
 def telegram_send(
@@ -914,7 +950,7 @@ def telegram_send(
 
     response = request_json(
         endpoint,
-        post={
+        payload={
             "chat_id": chat_id,
             "text": message,
             "disable_web_page_preview": True
@@ -928,47 +964,40 @@ def telegram_send(
         )
 
 
-# ========================================
-# ГРУППИРОВКА УВЕДОМЛЕНИЙ
-# ========================================
-
 def group_alerts(
     alerts: list[Alert]
-):
+) -> list[str]:
 
-    header = (
-        "BingX MACD (12,26,9)\n"
-        "Пересечение нулевой линии\n"
-        "Таймфрейм: 15m\n"
-        "Оборот: от 1 млн USDT/24ч\n"
-        f"С предыдущего пересечения: "
-        f"|MACD|/|гистограмма| "
-        f"≥ {MACD_HIST_MIN_RATIO}x\n"
+    heading = (
+        "BingX MACD(12,26,9) — "
+        "пересечение нуля\n"
+        "ТФ: 15m | "
+        "Оборот ≥ 1 млн USDT за 24 ч\n"
+        f"Экстремум |MACD| / "
+        f"экстремум |Histogram| "
+        f"≥ {EXTREMA_MIN_RATIO}x\n"
     )
 
     messages = []
-    current = header
+    current = heading
 
     for alert in alerts:
 
-        entry = "\n" + alert.display() + "\n"
+        entry = (
+            "\n" + alert.display() + "\n"
+        )
 
         if (
             len(current) + len(entry) > 3400
-            and current != header
+            and current != heading
         ):
-            messages.append(
-                current.rstrip()
-            )
-
-            current = header
+            messages.append(current.rstrip())
+            current = heading
 
         current += entry
 
-    if current != header:
-        messages.append(
-            current.rstrip()
-        )
+    if current != heading:
+        messages.append(current.rstrip())
 
     return messages
 
@@ -981,7 +1010,11 @@ def main():
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s"
+        format=(
+            "%(asctime)s "
+            "%(levelname)s "
+            "%(message)s"
+        )
     )
 
     token = os.getenv(
@@ -994,12 +1027,14 @@ def main():
 
     if not token or not chat_id:
         raise RuntimeError(
-            "Configure Telegram secrets in GitHub"
+            "Set GitHub secrets "
+            "TELEGRAM_BOT_TOKEN and "
+            "TELEGRAM_CHAT_ID"
         )
 
     if not 1 <= WORKERS <= 12:
         raise ValueError(
-            "MAX_WORKERS must be between 1 and 12"
+            "MAX_WORKERS must be 1..12"
         )
 
     state = load_state()
@@ -1011,8 +1046,8 @@ def main():
 
     eligible = set(symbols)
 
-    # Оставляем только состояние 15m
-    # для монет, прошедших фильтр оборота
+    # Сохраняем только состояние 15m
+    # для монет с подходящим оборотом
     new_last = {
         key: value
         for key, value in old_last.items()
@@ -1029,54 +1064,48 @@ def main():
     bootstrapped = 0
     young = 0
 
-    jobs = {}
+    tasks = {}
 
     with concurrent.futures.ThreadPoolExecutor(
         max_workers=WORKERS
-    ) as executor:
+    ) as pool:
 
         for symbol in symbols:
 
             key = f"{symbol}|15m"
+            last_ms = old_last.get(key)
 
-            previous = old_last.get(key)
-
-            # Пропускаем уже обработанные свечи
             if (
-                previous is not None
-                and previous >= latest_closed_boundary(
+                last_ms is not None
+                and last_ms >= latest_closed_boundary(
                     server_ms
                 )
             ):
                 skipped += 1
                 continue
 
-            future = executor.submit(
+            future = pool.submit(
                 scan_symbol,
                 symbol,
                 server_ms,
-                previous
+                last_ms
             )
 
-            jobs[future] = key
+            tasks[future] = key
 
-        for i, future in enumerate(
-            concurrent.futures.as_completed(jobs),
+        for index, future in enumerate(
+            concurrent.futures.as_completed(tasks),
             1
         ):
 
-            key = jobs[future]
+            key = tasks[future]
 
             try:
-                found, newest, status = (
+                batch, newest, status = (
                     future.result()
                 )
 
             except Exception as exc:
-
-                errors.append(
-                    (key, str(exc))
-                )
 
                 LOG.error(
                     "BingX failed %s: %s",
@@ -1084,12 +1113,15 @@ def main():
                     exc
                 )
 
+                errors.append(
+                    (key, str(exc))
+                )
                 continue
 
             if newest is not None:
                 new_last[key] = newest
 
-            alerts.extend(found)
+            alerts.extend(batch)
 
             bootstrapped += (
                 status == "bootstrapped"
@@ -1099,11 +1131,11 @@ def main():
                 status == "young"
             )
 
-            if i % 100 == 0:
+            if index % 100 == 0:
                 LOG.info(
                     "Processed %d/%d",
-                    i,
-                    len(jobs)
+                    index,
+                    len(tasks)
                 )
 
     LOG.info(
@@ -1113,7 +1145,7 @@ def main():
         "errors=%d alerts=%d",
         len(symbols),
         total,
-        len(jobs),
+        len(tasks),
         skipped,
         bootstrapped,
         young,
@@ -1121,18 +1153,18 @@ def main():
         len(alerts)
     )
 
-    # Не сохраняем состояние при
-    # массовых ошибках запросов
+    # При массовых ошибках
+    # не сохраняем контрольные точки
     if (
-        jobs
+        tasks
         and len(errors) > max(
             10,
-            len(jobs) // 5
+            len(tasks) // 5
         )
     ):
         raise RuntimeError(
             f"Too many BingX errors: "
-            f"{len(errors)}/{len(jobs)}"
+            f"{len(errors)}/{len(tasks)}"
         )
 
     alerts.sort(
@@ -1144,7 +1176,8 @@ def main():
 
     messages = group_alerts(alerts)
 
-    # Первичная синхронизация
+    # Служебное сообщение при
+    # первой синхронизации
     if not any(
         key.endswith("|15m")
         for key in old_last
@@ -1153,22 +1186,20 @@ def main():
         messages.insert(
             0,
             (
-                "✅ BingX MACD-сканер активен.\n"
-                f"Активных USDT-фьючерсов: {total}\n"
-                f"Оборот от 1 млн USDT: "
-                f"{len(symbols)}\n"
-                "Таймфрейм: 15m\n"
-                f"Условие: ≥ "
-                f"{MACD_HIST_MIN_RATIO}x\n"
-                "Проверка всего участка "
-                "между пересечениями нуля."
+                "✅ BingX MACD scanner ready\n"
+                f"USDT contracts: {total}\n"
+                f"Passed turnover: {len(symbols)}\n"
+                "Timeframe: 15m\n"
+                "Filter: extreme |MACD| >= "
+                "1.5 * extreme |Histogram|\n"
+                "Initial scan: synchronization."
             )
         )
 
-    # Отправка Telegram-сигналов
-    for i, message in enumerate(messages):
+    # Telegram
+    for index, message in enumerate(messages):
 
-        if i:
+        if index:
             time.sleep(1.1)
 
         telegram_send(
@@ -1177,7 +1208,7 @@ def main():
             message
         )
 
-    # Сохранение контрольных точек
+    # Сохраняем состояние
     state["last"] = new_last
 
     state["updated_utc"] = (
@@ -1189,14 +1220,15 @@ def main():
     save_state(state)
 
     LOG.info(
-        "Saved %d checkpoints. Telegram messages=%d",
+        "Saved %d BingX checkpoints; "
+        "Telegram messages=%d",
         len(new_last),
         len(messages)
     )
 
     if errors:
         LOG.warning(
-            "Some symbols failed; previous checkpoints retained"
+            "Failed symbols keep their checkpoints"
         )
 
 
