@@ -31,10 +31,7 @@ from dataclasses import dataclass
 
 API_URL = "https://open-api.bingx.com"
 
-INTERVAL_MINUTES = {
-    "5m": 5,
-    "15m": 15,
-}
+INTERVAL_MINUTES = {"15m": 15}
 
 MIN_TURNOVER_24H_USDT = 1_000_000.0
 
@@ -1242,7 +1239,7 @@ def main():
                 f"Активных USDT-фьючерсов: {total}\n"
                 f"Прошли оборот ≥ 1 млн USDT/24ч: "
                 f"{len(symbols)}\n"
-                "Таймфреймы: 5m и 15m\n"
+                "Таймфреймы: 15m\n"
                 f"Условие до пересечения: "
                 f"≥ {MACD_HIST_MIN_RATIO}x\n"
                 "Первый запуск: синхронизация "
